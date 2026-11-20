@@ -45,6 +45,226 @@ button{font:inherit;color:inherit;border:0;cursor:pointer;border-radius:18px}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 @keyframes pop{from{transform:scale(.85);opacity:.4}to{transform:scale(1);opacity:1}}
 .pop{animation:pop .12s ease-out}
+#pair.mini{position:fixed;right:16px;bottom:16px;gap:12px;opacity:.85}
+#pair.mini #qr{padding:6px}#pair.mini #qr img,#pair.mini #qr canvas{width:96px;height:96px}
+#pair.mini .code{font-size:22px}#pair.mini .small{display:none}
+</style>
+</head>
+<body>
+<header><b>Play / Pause</b><div id="status"><i></i><span id="stxt">nicht verbunden</span></div></header>
+
+<main id="vStart">
+  <h1>Was ist dieses Gerät?</h1>
+  <div class="choose">
+    <button id="cRecv">Anzeige<span>Rechner – zeigt Play/Pause an</span></button>
+    <button id="cSend">Fernbedienung<span>Telefon – sendet Play/Pause</span></button>
+  </div>
+</main>
+
+<main id="vRecv" class="hide">
+  <div id="icon"></div>
+  <div id="pair">
+    <div id="qr"></div>
+    <div><div class="small">Kopplungscode</div><div class="code" id="code">······</div>
+    <div class="small">QR-Code mit dem Telefon scannen<br>oder Code in der Fernbedienung eingeben</div></div>
+  </div>
+  <div class="small" id="lat"></div>
+  <button class="link" id="newCode">Neuen Code erzeugen</button>
+</main>
+
+<main id="vSend" class="hide">
+  <form id="join"><input id="inCode" maxlength="12" autocomplete="off" placeholder="CODE" inputmode="text"><button>Koppeln</button></form>
+  <div id="pads" class="off">
+    <button id="bPlay"><svg viewBox="0 0 24 24"><path d="M7 4v16l13-8z" fill="currentColor"/></svg>Play</button>
+    <button id="bPause"><svg viewBox="0 0 24 24"><path d="M6 4h4v16H6zM14 4h4v16h-4z" fill="currentColor"/></svg>Pause</button>
+  </div>
+  <div class="small" id="lat2"></div>
+  <button class="link" id="back">Gerätetyp wechseln</button>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script>
+{
+const $=id=>document.getElementById(id);
+const PRE='pp-rmt-';
+const ALPH='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const LIVE='https://dyllongr-cmd.github.io/playpause/';
+const P=new URLSearchParams(location.search);
+const FIXED=(P.get('d')||window.PP_ROOM||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+const BROKERS=P.get('mq')?[P.get('mq')]:['wss://broker.hivemq.com:8884/mqtt','wss://broker.emqx.io:8084/mqtt'];
+const ICE={iceServers:[{urls:['stun:stun.l.google.com:19302','stun:stun.cloudflare.com:3478']},
+  {urls:['turn:openrelay.metered.ca:80','turn:openrelay.metered.ca:443','turn:openrelay.metered.ca:443?transport=tcp'],username:'openrelayproject',credential:'openrelayproject'}]};
+const store={get:k=>{try{return localStorage.getItem(k)}catch(e){return null}},set:(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}},del:k=>{try{localStorage.removeItem(k)}catch(e){}}};
+const ICONS={
+  idle:'<svg viewBox="0 0 100 100"><circle cx="50" cy="50" r="46" fill="none" stroke="#333" stroke-width="4"/><path d="M38 28v44l34-22z" fill="#333"/></svg>',
+  play:'<svg viewBox="0 0 100 100"><circle cx="50" cy="50" r="48" fill="#1fd17a"/><path d="M38 27v46l36-23z" fill="#04210f"/></svg>',
+  pause:'<svg viewBox="0 0 100 100"><circle cx="50" cy="50" r="48" fill="#ff9f1a"/><path d="M33 28h12v44H33zM55 28h12v44H55z" fill="#2b1700"/></svg>'
+};
+const rid=()=>Math.random().toString(36).slice(2,10);
+let PID=store.get('pp-pid');if(!PID){PID=rid();store.set('pp-pid',PID)}
+let peer=null,conn=null,mq=null,timers=[],gen=0;
+const conns=new Set(),phones=new Map(),seen=new Set();
+
+function status(on,txt){$('status').classList.toggle('on',on);$('stxt').textContent=txt}
+function show(v){for(const x of ['vStart','vRecv','vSend'])$(x).classList.toggle('hide',x!==v)}
+function newCode(){let s='';for(const b of crypto.getRandomValues(new Uint8Array(6)))s+=ALPH[b%ALPH.length];return s}
+function setIcon(k){const el=$('icon');el.innerHTML=ICONS[k];el.classList.remove('pop');void el.offsetWidth;el.classList.add('pop')}
+function later(fn,ms){const g=gen;timers.push(setTimeout(()=>{if(g===gen)fn()},ms))}
+function every(fn,ms){const g=gen;const t=setInterval(()=>{if(g===gen)fn();else clearInterval(t)},ms);timers.push(t)}
+function killRtc(){for(const c of conns)try{c.close()}catch(e){}conns.clear();try{conn&&conn.close()}catch(e){}try{peer&&peer.destroy()}catch(e){}peer=conn=null}
+function kill(){gen++;timers.forEach(t=>{clearTimeout(t);clearInterval(t)});timers=[];killRtc();try{mq&&mq.end(true)}catch(e){}mq=null}
+function firstTime(id){if(!id)return true;if(seen.has(id))return false;seen.add(id);if(seen.size>500)seen.delete(seen.values().next().value);return true}
+
+/* Relay-Weg (MQTT über WebSocket) – funktioniert in jedem Netz */
+function startMq(room,sub,onMsg){
+  if(typeof mqtt==='undefined')return;
+  let i=0;const g=gen;
+  const go=()=>{if(g!==gen)return;
+    const c=mqtt.connect(BROKERS[i%BROKERS.length],{clientId:'pp_'+rid(),keepalive:20,reconnectPeriod:0,connectTimeout:5000,clean:true});
+    mq=c;
+    c.on('connect',()=>c.subscribe('pp-rmt/'+room+'/'+sub,{qos:0}));
+    c.on('message',(t,b)=>{try{onMsg(JSON.parse(b.toString()))}catch(e){}});
+    const again=()=>{if(mq===c&&g===gen){mq=null;try{c.end(true)}catch(e){}i++;later(go,1500)}};
+    c.on('close',again);c.on('error',again);c.on('offline',again);
+  };go();
+}
+function mqSend(room,sub,o){if(mq&&mq.connected)mq.publish('pp-rmt/'+room+'/'+sub,JSON.stringify(o),{qos:0})}
+
+/* ---------- Anzeige (Rechner) ---------- */
+function recvStatus(){const now=Date.now();for(const [k,v] of phones)if(now-v>4000)phones.delete(k);const n=phones.size;
+  status(n>0,n===0?'warte auf Telefon …':n===1?'1 Telefon verbunden':n+' Telefone verbunden');
+  $('pair').classList.toggle('mini',n>0)}
+function startRecv(fresh){
+  kill();show('vRecv');store.set('pp-role','recv');
+  const code=FIXED||(!fresh&&store.get('pp-code'))||newCode();store.set('pp-code',code);
+  $('code').textContent=code;$('newCode').classList.toggle('hide',!!FIXED);setIcon('idle');$('lat').textContent='';
+  const url=(/^https?:$/.test(location.protocol)?location.href.split(/[?#]/)[0]:LIVE)+'?c='+code;
+  $('qr').innerHTML='';try{new QRCode($('qr'),{text:url,width:180,height:180,correctLevel:QRCode.CorrectLevel.M})}catch(e){}
+  phones.clear();recvStatus();
+  const handle=(d,reply)=>{
+    if(!d||typeof d!=='object')return;
+    if(d.p)phones.set(d.p,Date.now());
+    if(d.t==='ping'){reply({t:'pong',p:d.p,s:d.s,v:d.v});recvStatus();return}
+    if(d.t==='lat'){$('lat').textContent='Verzögerung ca. '+d.v+' ms';return}
+    if((d.t==='play'||d.t==='pause')&&firstTime(d.id)){setIcon(d.t);recvStatus()}
+  };
+  startMq(code,'p',d=>handle(d,o=>mqSend(code,'d',o)));
+  const rtc=()=>{
+    killRtc();
+    const p=peer=new Peer(PRE+code,{debug:0,config:ICE});
+    p.on('error',e=>{
+      if(e.type==='unavailable-id'&&!FIXED){startRecv(true);return}
+      if(e.type!=='peer-unavailable')later(rtc,3000)});
+    p.on('disconnected',()=>later(()=>{try{if(!p.destroyed)p.reconnect()}catch(e){}},1000));
+    p.on('connection',c=>{conns.add(c);
+      c.on('data',d=>handle(d,o=>{try{c.open&&c.send(o)}catch(e){}}));
+      const gone=()=>conns.delete(c);c.on('close',gone);c.on('error',gone)});
+  };
+  if(typeof Peer!=='undefined')rtc();
+  every(recvStatus,1000);
+}
+
+/* ---------- Fernbedienung (Telefon) ---------- */
+function startSend(code){
+  kill();show('vSend');store.set('pp-role','send');
+  $('pads').classList.add('off');$('lat2').textContent='';
+  if(!code){status(false,'Code eingeben');$('join').classList.remove('hide');return}
+  code=code.toUpperCase().replace(/[^A-Z0-9]/g,'');$('inCode').value=code;store.set('pp-target',code);
+  status(false,'verbinde mit '+code+' …');
+  let lastR=0,lastM=0;
+  const onPong=(d,via)=>{if(!d||d.p!==PID)return;const now=performance.now();
+    if(d.t==='pong'){if(via==='r')lastR=now;else lastM=now;
+      if(d.v===via){const v=Math.round((now-d.s)/2);$('lat2').textContent='Verzögerung ca. '+v+' ms'+(via==='r'?' (direkt)':' (über Server)');send1({t:'lat',v,p:PID})}}};
+  startMq(code,'d',d=>onPong(d,'m'));
+  const rtc=()=>{
+    if(typeof Peer==='undefined')return;
+    try{conn&&conn.close()}catch(e){}try{peer&&peer.destroy()}catch(e){}conn=null;
+    const p=peer=new Peer({debug:0,config:ICE});
+    p.on('open',()=>{const c=p.connect(PRE+code,{reliable:false,serialization:'json'});conn=c;
+      c.on('data',d=>onPong(d,'r'));c.on('close',()=>later(rtc,2000))});
+    p.on('error',()=>later(rtc,3000));
+  };rtc();
+  // Herzschlag über beide Wege
+  every(()=>{const s=performance.now();
+    if(conn&&conn.open)try{conn.send({t:'ping',p:PID,s,v:'r'})}catch(e){}
+    mqSend(code,'p',{t:'ping',p:PID,s,v:'m'});
+    const now=performance.now(),okR=now-lastR<3000,okM=now-lastM<3000;
+    if(okR||okM){status(true,'verbunden mit '+code);$('pads').classList.remove('off');$('join').classList.add('hide')}
+    else{status(false,'warte auf Anzeige '+code+' …');$('pads').classList.add('off');$('join').classList.remove('hide')}
+    if(!okR&&conn&&conn.open&&now-lastR>8000&&lastR)later(rtc,0);
+  },1000);
+}
+function send1(o){const c=$('stxt').textContent;if(conn&&conn.open)try{conn.send(o)}catch(e){}mqSend(store.get('pp-target'),'p',o)}
+function send(t){const o={t,id:rid(),p:PID,s:performance.now()};send1(o)}
+
+/* ---------- Events ---------- */
+$('cRecv').onclick=()=>startRecv(false);
+$('cSend').onclick=()=>startSend(store.get('pp-target'));
+$('newCode').onclick=()=>startRecv(true);
+$('back').onclick=()=>{kill();store.del('pp-role');status(false,'nicht verbunden');show('vStart')};
+$('join').onsubmit=e=>{e.preventDefault();startSend($('inCode').value)};
+for(const [id,t] of [['bPlay','play'],['bPause','pause']])
+  $(id).addEventListener('pointerdown',e=>{e.preventDefault();send(t)});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&store.get('pp-role')==='send')startSend(store.get('pp-target'))});
+
+const q=P.get('c');
+if(q)startSend(q);
+else if(FIXED)startRecv(false);
+else if(store.get('pp-role')==='recv')startRecv(false);
+else if(store.get('pp-role')==='send')startSend(store.get('pp-target'));
+}
+</script>
+</body>
+</html>
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Play / Pause Fernbedienung</title>
+<style>
+:root{--bg:#0e0e0e;--ink:#f4f4f4;--dim:#8a8a8a;--play:#1fd17a;--pause:#ff9f1a;--red:#e4002b}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--ink);font:17px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;min-height:100vh;display:flex;flex-direction:column;-webkit-tap-highlight-color:transparent}
+header{display:flex;justify-content:space-between;align-items:center;padding:14px 20px;gap:12px}
+header b{font-size:15px;letter-spacing:.02em}
+#status{font-size:14px;color:var(--dim);display:flex;align-items:center;gap:8px}
+#status i{width:10px;height:10px;border-radius:50%;background:var(--red);display:inline-block}
+#status.on i{background:var(--play)}
+main{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px;gap:24px;text-align:center}
+h1{font-size:clamp(28px,5vw,44px);line-height:1.1}
+.choose{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;width:min(560px,100%)}
+button{font:inherit;color:inherit;border:0;cursor:pointer;border-radius:18px}
+.choose button{background:#1c1c1c;padding:28px 20px;font-size:20px;font-weight:600}
+.choose button span{display:block;font-size:14px;font-weight:400;color:var(--dim);margin-top:6px}
+.choose button:hover,.choose button:focus-visible{background:#2a2a2a;outline:2px solid #555}
+.hide{display:none!important}
+/* Anzeige */
+#icon{width:min(60vmin,520px);height:min(60vmin,520px)}
+#icon svg{width:100%;height:100%}
+#pair{display:flex;gap:28px;align-items:center;flex-wrap:wrap;justify-content:center}
+#qr{background:#fff;padding:12px;border-radius:12px}
+#qr img,#qr canvas{display:block;width:180px;height:180px}
+.code{font-size:clamp(40px,8vw,72px);font-weight:800;letter-spacing:.12em;font-variant-numeric:tabular-nums}
+.small{font-size:14px;color:var(--dim)}
+#lat{font-variant-numeric:tabular-nums}
+/* Fernbedienung */
+#join{display:flex;gap:10px;width:min(420px,100%)}
+#join input{flex:1;font:inherit;font-size:24px;text-transform:uppercase;letter-spacing:.15em;text-align:center;padding:12px;border-radius:14px;border:2px solid #333;background:#161616;color:var(--ink)}
+#join button{background:var(--ink);color:var(--bg);padding:0 22px;font-weight:700}
+#pads{display:grid;grid-template-rows:1fr 1fr;gap:16px;width:min(480px,100%);height:min(70vh,560px)}
+#pads button{font-size:30px;font-weight:800;display:flex;align-items:center;justify-content:center;gap:16px;touch-action:manipulation;transition:transform .06s}
+#pads button:active{transform:scale(.97)}
+#bPlay{background:var(--play);color:#04210f}
+#bPause{background:var(--pause);color:#2b1700}
+#pads button svg{width:48px;height:48px}
+#pads.off button{opacity:.35}
+.link{color:var(--dim);background:none;font-size:14px;text-decoration:underline;padding:8px}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+@keyframes pop{from{transform:scale(.85);opacity:.4}to{transform:scale(1);opacity:1}}
+.pop{animation:pop .12s ease-out}
 </style>
 </head>
 <body>
